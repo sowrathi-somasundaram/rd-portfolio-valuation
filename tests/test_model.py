@@ -4,15 +4,30 @@ import numpy as np
 import pytest
 
 from rnpv.analysis import (compare_selections, optimal_selection, portfolio_table, portfolio_tornado,
-                           simulate_drug, simulate_portfolio, tornado)
+                           simulate_drug, simulate_portfolio, stage_gate_table, tornado)
+from rnpv.robustness import run_study, summarize_study
 from rnpv.data import DEFAULT_BUDGET, DEFAULT_DRUGS, DEFAULT_RATE
-from rnpv.model import BIO_SUCCESS, loa, value
+from rnpv.model import ALL_INDICATIONS, BIO_SUCCESS, loa, value
 
 P, R = BIO_SUCCESS, DEFAULT_RATE
 
 
 def test_loa_from_phase_one_matches_bio():
-    assert loa(DEFAULT_DRUGS[0], P) == pytest.approx(0.079, abs=0.001)
+    generic = replace(DEFAULT_DRUGS[0], benchmark=ALL_INDICATIONS)
+    assert loa(generic, P) == pytest.approx(0.079, abs=0.001)
+
+
+@pytest.mark.parametrize("area, expected", [("Oncology", 0.053), ("Hematology", 0.239), ("Neurology", 0.059),
+                                            ("Respiratory", 0.075), ("Vaccine", 0.097)])
+def test_disease_area_loa_matches_bio(area, expected):
+    # BIO 2011-2020, Figure 5b (and Figure 9 for vaccines): LOA from Phase I by area.
+    drug = replace(DEFAULT_DRUGS[0], benchmark=area)
+    assert loa(drug, P) == pytest.approx(expected, abs=0.0015)
+
+
+def test_area_benchmark_ignores_shared_rates():
+    onc = DEFAULT_DRUGS[0]
+    assert value(onc, P, R).rnpv == pytest.approx(value(onc, (0.9, 0.9, 0.9, 0.9), R).rnpv)
 
 
 @pytest.mark.parametrize("drug", DEFAULT_DRUGS, ids=lambda d: d.name)
@@ -22,7 +37,7 @@ def test_risk_adjustment_lowers_value(drug):
 
 
 def test_certain_success_makes_rnpv_equal_npv():
-    v = value(DEFAULT_DRUGS[0], (1.0, 1.0, 1.0, 1.0), R)
+    v = value(replace(DEFAULT_DRUGS[0], benchmark=ALL_INDICATIONS), (1.0, 1.0, 1.0, 1.0), R)
     assert v.rnpv == pytest.approx(v.npv)
 
 
@@ -80,3 +95,30 @@ def test_portfolio_tornado_is_sum_of_drug_tornados():
     peak = t.set_index("Input").loc["Peak sales"]
     expected = sum(tornado(d, P, R)[1].set_index("Input").loc["Peak sales", "Swing"] for d in DEFAULT_DRUGS)
     assert peak["Swing"] == pytest.approx(expected)
+
+
+def test_stage_gating_never_hurts_and_stops_weak_programmes():
+    g = stage_gate_table(DEFAULT_DRUGS, P, R, 20_000, seed=1).set_index("Drug")
+    # Same draws, and the gate only stops when continuing has negative expected value.
+    se = 400 / np.sqrt(20_000)
+    assert (g["Stage-gated"] >= g["Committed"] - 2 * se).all()
+    # ONC-117's continuation value is negative before Phase II, so every path that gets there stops.
+    assert g.loc["ONC-117", "Stopped at a gate"] == pytest.approx(0.488, abs=0.015)
+    assert g.loc["ONC-117", "Value added"] > 0
+    # A drug already in Phase III has no later gate with new information worth acting on.
+    assert g.loc["RES-402", "Stopped at a gate"] == 0
+
+
+def test_committed_simulation_unchanged_by_gating():
+    a = simulate_portfolio(DEFAULT_DRUGS, P, R, 5_000, seed=3)
+    b = stage_gate_table(DEFAULT_DRUGS, P, R, 5_000, seed=3).set_index("Drug")["Committed"]
+    assert np.allclose(a.mean().to_numpy(), b.to_numpy())
+
+
+def test_robustness_study():
+    df = run_study(n_portfolios=150, seed=11)
+    s = summarize_study(df)
+    assert s["win"] + s["tie"] + s["loss"] == pytest.approx(1.0)
+    assert s["capture_rnpv_median"] >= s["capture_npv_median"]
+    assert s["win"] > s["loss"]
+    assert run_study(n_portfolios=20, seed=11).equals(run_study(n_portfolios=20, seed=11))

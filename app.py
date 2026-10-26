@@ -10,9 +10,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from rnpv.analysis import (SCENARIOS, all_subsets, compare_selections, greedy_selection, optimal_selection,
-                           portfolio_table, scenario_values, simulate_portfolio, summarize, tornado)
+                           portfolio_table, scenario_values, simulate_portfolio, stage_gate_table, summarize,
+                           portfolio_tornado, tornado)
 from rnpv.data import DEFAULT_BUDGET, DEFAULT_DRUGS, DEFAULT_RATE
-from rnpv.model import BIO_SUCCESS, PHASES, START_YEAR, Drug, cash_flows, value
+from rnpv.model import ALL_INDICATIONS, BIO_BY_AREA, BIO_SUCCESS, PHASES, START_YEAR, Drug, cash_flows, value
+from rnpv.robustness import run_study, summarize_study
 
 st.set_page_config(page_title="R&D Portfolio Valuation", page_icon="💊", layout="wide")
 
@@ -36,14 +38,14 @@ def style(fig: go.Figure, height: int = 380, **kw) -> go.Figure:
 
 # ---------------------------------------------------------------- inputs
 
-COLS = ["Name", "Area", "Phase",
+COLS = ["Name", "Area", "Phase", "BIO benchmark",
         *[f"{ph} yrs" for ph in PHASES], *[f"{ph} cost $M" for ph in PHASES],
         "Peak sales $M", "Years to peak", "Patent expiry", "Op. margin", "LOE erosion",
         "Peak sales CV", "Delay prob."]
 
 
 def drugs_to_df(drugs: list[Drug]) -> pd.DataFrame:
-    return pd.DataFrame([[d.name, d.area, d.phase, *d.durations, *d.costs, d.peak_sales, d.years_to_peak,
+    return pd.DataFrame([[d.name, d.area, d.phase, d.benchmark, *d.durations, *d.costs, d.peak_sales, d.years_to_peak,
                           d.patent_expiry, d.margin, d.loe_erosion, d.peak_cv, d.delay_prob]
                          for d in drugs], columns=COLS)
 
@@ -57,7 +59,8 @@ def df_to_drugs(df: pd.DataFrame) -> list[Drug]:
                         peak_sales=float(r["Peak sales $M"]), years_to_peak=int(r["Years to peak"]),
                         patent_expiry=int(r["Patent expiry"]), margin=float(r["Op. margin"]),
                         loe_erosion=float(r["LOE erosion"]), peak_cv=float(r["Peak sales CV"]),
-                        delay_prob=float(r["Delay prob."])))
+                        delay_prob=float(r["Delay prob."]),
+                        benchmark=r["BIO benchmark"] if r["BIO benchmark"] in BIO_BY_AREA else ALL_INDICATIONS))
     return out
 
 
@@ -72,25 +75,34 @@ with st.sidebar:
     seed = st.number_input("Random seed", 0, 10_000, 7)
 
     st.subheader("Phase success rates")
-    st.caption("Defaults: BIO / Informa / QLS, *Clinical Development Success Rates 2011–2020*, all indications.")
+    st.caption("Each candidate uses the BIO rates for its disease area (set on the Candidates tab). The rates "
+               "below apply to candidates benchmarked to **All indications**. Source: BIO / Informa / QLS, "
+               "*Clinical Development Success Rates 2011–2020*.")
     p = tuple(st.number_input(f"{ph} → next", 0.01, 1.0, BIO_SUCCESS[i], 0.01, key=f"p{i}")
               for i, ph in enumerate(PHASES))
     st.caption(f"Likelihood of approval from Phase I: **{np.prod(p):.1%}**")
+    with st.expander("BIO rates by disease area"):
+        area_df = pd.DataFrame(BIO_BY_AREA, index=[f"{ph} → next" for ph in PHASES]).T
+        area_df["LOA from Phase I"] = area_df.prod(axis=1)
+        st.dataframe(area_df.style.format("{:.1%}"), use_container_width=True)
 
 st.title("R&D Portfolio Valuation")
 st.caption("Risk-adjusted NPV, scenario and sensitivity analysis, Monte Carlo simulation, and budget-"
            "constrained prioritisation for five hypothetical drug candidates. All figures are nominal $.")
 
-tabs = st.tabs(["Candidates", "1 · rNPV", "2 · Scenarios & sensitivity", "3 · Monte Carlo",
-                "4 · Portfolio", "Method & sources"])
+tabs = st.tabs(["Summary", "Candidates", "1 · rNPV", "2 · Scenarios & sensitivity", "3 · Monte Carlo",
+                "4 · Portfolio", "5 · Robustness", "Method & sources"])
 
-with tabs[0]:
+with tabs[1]:
     st.markdown("Edit any input; every tab recalculates. Costs are totals per phase, spread evenly over "
                 "its duration. Phases before a drug's current phase are ignored.")
     edited = st.data_editor(
         st.session_state.drug_df, num_rows="dynamic", use_container_width=True, hide_index=True,
         column_config={
             "Phase": st.column_config.SelectboxColumn(options=list(PHASES), required=True),
+            "BIO benchmark": st.column_config.SelectboxColumn(
+                options=list(BIO_BY_AREA), required=True,
+                help="Which BIO success-rate table applies. 'All indications' uses the sidebar rates."),
             "Op. margin": st.column_config.NumberColumn(format="%.2f", min_value=0.0, max_value=1.0),
             "LOE erosion": st.column_config.NumberColumn(format="%.2f", min_value=0.0, max_value=1.0,
                                                          help="Share of sales lost each year after patent expiry"),
@@ -117,11 +129,24 @@ def run_mc(drugs: list[Drug], p: tuple, rate: float, n: int, seed: int) -> pd.Da
 
 
 sims = run_mc(drugs, p, rate, n_sims, seed)
+
+
+@st.cache_data(show_spinner="Simulating stage-gated programmes…")
+def run_gates(drugs: list[Drug], p: tuple, rate: float, n: int, seed: int) -> pd.DataFrame:
+    return stage_gate_table(drugs, p, rate, n, seed)
+
+
+@st.cache_data(show_spinner="Testing 1,000 random portfolios…")
+def run_robustness() -> pd.DataFrame:
+    return run_study()
+
+
+gates = run_gates(drugs, p, rate, n_sims, seed)
 table = portfolio_table(drugs, p, rate)
 
 # ---------------------------------------------------------------- 1 · rNPV
 
-with tabs[1]:
+with tabs[2]:
     drug = by_name[st.selectbox("Candidate", names, key="t1")]
     v = value(drug, p, rate)
     cf = cash_flows(drug, p, rate)
@@ -166,7 +191,7 @@ with tabs[1]:
 
 # ---------------------------------------------------------------- 2 · Scenarios & sensitivity
 
-with tabs[2]:
+with tabs[3]:
     st.subheader("Scenarios")
     scen = st.data_editor(SCENARIOS, use_container_width=True, key="scen")
     sv = pd.concat([scenario_values(d, p, rate, scen).assign(Drug=d.name) for d in drugs])
@@ -223,7 +248,7 @@ def stat_row(s: dict, rnpv: float | None = None):
     c[4].metric("P90", money(s["p90"]))
 
 
-with tabs[3]:
+with tabs[4]:
     st.markdown(f"**{n_sims:,} simulated futures.** In each one, every drug passes or fails each phase "
                 "(Bernoulli draws at the phase success rates), peak sales are drawn from a lognormal whose mean "
                 "is the base case, and launch may slip 1–2 years. A path's value is the plain NPV of what happened.")
@@ -239,9 +264,22 @@ with tabs[3]:
                "checks this. A single early-stage drug is a lottery ticket: most paths lose the development spend, "
                "and a few pay off hugely. Pooling drugs is what makes the distribution usable.")
 
+    st.subheader("Committing vs stage-gating")
+    st.markdown("The simulation above assumes a funded drug runs until it fails or is approved. Real portfolio "
+                "teams review each programme before the next phase and stop it if continuing is no longer worth "
+                "it. Here, the Phase II readout reveals the drug's true commercial potential, so from the Phase III "
+                "gate on, the decision uses it; earlier gates use the forecast. Same simulated paths for both.")
+    st.dataframe(gates.style.format({"Committed": "{:,.1f}", "Stage-gated": "{:,.1f}", "Value added": "{:+,.1f}",
+                                     "Stopped at a gate": "{:.1%}", "P(loss) committed": "{:.1%}",
+                                     "P(loss) gated": "{:.1%}"}),
+                 hide_index=True, use_container_width=True)
+    st.caption("Expected value in $M (simulated mean). Gating helps most on marginal programmes, where it stops "
+               "spending before the expensive phases. A strong drug that clears Phase II is almost always worth "
+               "finishing, so for those the gate rarely changes anything.")
+
 # ---------------------------------------------------------------- 4 · Portfolio
 
-with tabs[4]:
+with tabs[5]:
     optimal = optimal_selection(table, budget)
     greedy = greedy_selection(table, budget)
 
@@ -333,7 +371,99 @@ with tabs[4]:
         fig.update_layout(barmode="overlay", xaxis=dict(dtick=1, range=[START_YEAR, None]))
         st.plotly_chart(style(fig, height=110 + 50 * len(funded), title_text=""), use_container_width=True)
 
+# ---------------------------------------------------------------- 5 · Robustness
+
+study = run_robustness()
+rs = summarize_study(study)
+
+with tabs[6]:
+    st.markdown("Is the rNPV-per-dollar ranking better only for these five drugs? To check, the app generates "
+                f"**{len(study):,} random five-drug portfolios** (random phase, disease area, costs, timelines and "
+                "sales), gives each a budget of 30–70% of what funding everything would cost, and applies both "
+                "ranking rules. Each rule is scored by the total rNPV it funds.")
+    c = st.columns(4)
+    c[0].metric("rNPV ranking better", f"{rs['win']:.1%}")
+    c[1].metric("Same choice", f"{rs['tie']:.1%}")
+    c[2].metric("Plain NPV better", f"{rs['loss']:.1%}")
+    c[3].metric("NPV ranking funds a money-loser", f"{rs['npv_funds_destroyer']:.1%}",
+                help="Share of portfolios where the plain-NPV pick includes a drug with negative rNPV")
+    c = st.columns(3)
+    c[0].metric("Median value captured: rNPV ranking", f"{rs['capture_rnpv_median']:.1%}",
+                help="Total rNPV funded ÷ the best total any affordable combination could achieve")
+    c[1].metric("Median value captured: plain NPV", f"{rs['capture_npv_median']:.1%}")
+    c[2].metric("Median extra rNPV from ranking by rNPV", money(rs["uplift_median"]))
+
+    ok = study[study["Best possible"] > 0].copy()
+    ok["Budget"] = pd.cut(ok["Budget share"], [0.3, 0.4, 0.5, 0.6, 0.7],
+                          labels=["30–40%", "40–50%", "50–60%", "60–70%"])
+    for col in ("Rank by rNPV per R&D $", "Rank by plain NPV"):
+        ok[f"{col} captured"] = ok[col] / ok["Best possible"]
+    by = ok.groupby("Budget", observed=True)
+    fig = go.Figure([
+        go.Bar(x=by.size().index.astype(str), y=by[f"{col} captured"].median(),
+               name=name, marker_color=colour, hovertemplate="%{x} budget<br>median %{y:.1%}<extra>" + name + "</extra>")
+        for name, col, colour in (("Rank by rNPV per R&D $", "Rank by rNPV per R&D $", BLUE),
+                                  ("Rank by plain NPV", "Rank by plain NPV", ORANGE))
+    ])
+    st.plotly_chart(style(fig, title="Median share of the best possible value captured, by budget tightness",
+                          barmode="group", bargap=0.3, yaxis=dict(tickformat=".0%", range=[0, 1.05]),
+                          xaxis_title="Budget as a share of the cost of funding every candidate"),
+                    use_container_width=True)
+    st.caption(f"{len(study) - rs['n']} of {len(study):,} portfolios had no candidate worth funding and are excluded, "
+               f"leaving {rs['n']:,}. The rNPV ranking found the best possible combination in "
+               f"{rs['rnpv_rank_is_optimal']:.1%} of them. Inputs are drawn from illustrative ranges that bracket the "
+               "default candidates, with success rates from the BIO disease-area tables. Fixed seed, so results are "
+               "reproducible.")
+
+# ---------------------------------------------------------------- Summary
+
+with tabs[0]:
+    comp_all = compare_selections(drugs, p, rate, budget, sims)
+    best, npv_rule = comp_all.iloc[0], comp_all.iloc[1]
+    port = sims[optimal].sum(axis=1).to_numpy() if optimal else np.zeros(len(sims))
+    s0 = summarize(port)
+    tb, tor_all = portfolio_tornado(drugs, p, rate)
+    top = tor_all.iloc[0]
+    g = gates.set_index("Drug")
+
+    names_and = " and ".join([", ".join(optimal[:-1]), optimal[-1]] if len(optimal) > 1 else optimal) or "nothing"
+    st.subheader(f"Recommendation: fund {names_and}")
+    c = st.columns(5)
+    c[0].metric("Risk-adjusted value (rNPV)", money(t.loc[optimal, "rNPV"].sum() if optimal else 0))
+    c[1].metric("Expected R&D spend", money(t.loc[optimal, "Expected R&D spend"].sum() if optimal else 0),
+                help=f"R&D budget: {money(budget)}")
+    c[2].metric("Chance of losing money", f"{s0['p_loss']:.1%}")
+    c[3].metric("Bad case (P10)", money(s0["p10"]))
+    c[4].metric("Good case (P90)", money(s0["p90"]))
+
+    st.markdown("#### Key findings")
+    lines = []
+    if best["Total rNPV"] > 0 and set(best["Drugs funded"]) != set(npv_rule["Drugs funded"]):
+        lines.append(
+            f"**Plain NPV picks the wrong drugs.** Ranking by plain NPV would fund "
+            f"{', '.join(npv_rule['Drugs funded'])} for a similar budget, but that gives "
+            f"**{(npv_rule['Total rNPV'] - best['Total rNPV']) / best['Total rNPV']:+.1%}** risk-adjusted value "
+            f"({money(npv_rule['Total rNPV'])} vs {money(best['Total rNPV'])}) and raises the chance of losing money "
+            f"from {best['P(loss)']:.1%} to {npv_rule['P(loss)']:.1%}.")
+    lines.append(
+        f"**It holds beyond this example.** Across {rs['n']:,} random portfolios, ranking by rNPV per R&D dollar "
+        f"beat plain NPV in {rs['win']:.1%} of cases, tied in {rs['tie']:.1%} and lost in {rs['loss']:.1%}, "
+        f"capturing a median {rs['capture_rnpv_median']:.1%} of the best possible value vs {rs['capture_npv_median']:.1%}.")
+    lines.append(
+        f"**The biggest risk is {top['Input'].lower()}.** It moves total portfolio rNPV by {money(top['Swing'])} "
+        f"(from {money(top['rNPV downside'])} to {money(top['rNPV upside'])}); "
+        f"{tor_all.iloc[1]['Input'].lower()} is next at {money(tor_all.iloc[1]['Swing'])}.")
+    worst = g["Value added"].idxmax()
+    lines.append(
+        f"**Stage gates protect the downside on weak programmes.** Reviewing {worst} at each phase gate "
+        f"stops it on {g.loc[worst, 'Stopped at a gate']:.0%} of paths and adds {money(g.loc[worst, 'Value added'])} "
+        f"of expected value; for strong programmes the gate rarely changes the decision.")
+    for line in lines:
+        st.markdown("- " + line.replace("$", "\\$"))   # stop "$…$" rendering as maths
+    st.caption("All candidates are hypothetical. Success rates come from BIO's disease-area tables. Open the "
+               "other tabs to see or change any assumption; this summary updates with them.")
+
 # ---------------------------------------------------------------- Method
 
-with tabs[5]:
+with tabs[7]:
     st.markdown(open("METHODOLOGY.md", encoding="utf-8").read())

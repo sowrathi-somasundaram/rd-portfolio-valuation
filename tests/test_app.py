@@ -4,7 +4,7 @@ from streamlit.testing.v1 import AppTest
 def test_app_renders_without_errors():
     at = AppTest.from_file("app.py", default_timeout=60).run()
     assert not at.exception, at.exception
-    assert len(at.tabs) == 6
+    assert len(at.tabs) == 8
 
 
 def test_editing_budget_and_rate_reruns_cleanly():

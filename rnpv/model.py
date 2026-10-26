@@ -24,6 +24,28 @@ PHASES = ("Phase I", "Phase II", "Phase III", "Filing")
 # (Feb 2021), all indications. Phase-transition probabilities; LOA from Phase I = 7.9%.
 BIO_SUCCESS = (0.520, 0.289, 0.578, 0.906)
 
+# Same report, phase-transition success rates by disease area (Figure 2) and, for vaccines,
+# by modality (Figure 9). Order: Phase I->II, II->III, III->NDA/BLA, NDA/BLA->approval.
+ALL_INDICATIONS = "All indications"
+BIO_BY_AREA = {
+    ALL_INDICATIONS: BIO_SUCCESS,
+    "Hematology": (0.696, 0.481, 0.768, 0.931),
+    "Metabolic": (0.618, 0.450, 0.636, 0.875),
+    "Infectious disease": (0.578, 0.384, 0.640, 0.929),
+    "Ophthalmology": (0.716, 0.355, 0.512, 0.911),
+    "Autoimmune": (0.552, 0.314, 0.653, 0.941),
+    "Allergy": (0.564, 0.283, 0.647, 1.000),
+    "Gastroenterology": (0.467, 0.342, 0.571, 0.909),
+    "Respiratory": (0.559, 0.219, 0.645, 0.956),
+    "Psychiatry": (0.527, 0.268, 0.563, 0.912),
+    "Endocrine": (0.433, 0.266, 0.662, 0.863),
+    "Neurology": (0.477, 0.268, 0.531, 0.867),
+    "Oncology": (0.488, 0.246, 0.477, 0.920),
+    "Cardiovascular": (0.500, 0.210, 0.552, 0.825),
+    "Urology": (0.409, 0.150, 0.692, 0.846),
+    "Vaccine": (0.520, 0.322, 0.581, 1.000),
+}
+
 # Sales stop being modelled once post-patent sales fall below this share of peak.
 _TAIL_CUTOFF = 0.01
 _MAX_YEARS = 45
@@ -43,6 +65,7 @@ class Drug:
     loe_erosion: float          # share of sales lost each year after patent expiry
     peak_cv: float = 0.4        # Monte Carlo: coefficient of variation of peak sales
     delay_prob: float = 0.25    # Monte Carlo: probability of a launch slip
+    benchmark: str = ALL_INDICATIONS  # which BIO success-rate table applies (a BIO_BY_AREA key)
 
     @property
     def phase_idx(self) -> int:
@@ -57,6 +80,19 @@ class Drug:
                        costs=tuple(c * cost for c in self.costs))
 
 
+def resolve(drug: Drug, p: tuple) -> tuple[Drug, tuple]:
+    """Pick the success rates that apply to a drug.
+
+    A drug benchmarked to a specific BIO disease area uses that area's rates; one benchmarked
+    to "All indications" uses ``p``, the shared (user-editable) rates. Returns the drug with
+    its benchmark cleared plus the rates, so the result can be passed on and re-resolved
+    safely, and callers that adjust the rates (scenarios, tornado) adjust the right ones.
+    """
+    if drug.benchmark != ALL_INDICATIONS:
+        return replace(drug, benchmark=ALL_INDICATIONS), BIO_BY_AREA[drug.benchmark]
+    return drug, tuple(p)
+
+
 def _delay_index(n_remaining: int) -> int:
     """Delays stretch the last clinical phase (Phase III), or Filing if already filed."""
     return max(n_remaining - 2, 0)
@@ -68,6 +104,7 @@ def cash_flows(drug: Drug, p: tuple, rate: float, delay: int = 0) -> pd.DataFram
     ``p`` holds the success probability of each of the four phases. ``delay`` adds (or,
     if negative, removes) years from the last clinical phase at the same annual cost.
     """
+    drug, p = resolve(drug, p)
     i0 = drug.phase_idx
     durs = [int(d) for d in drug.durations[i0:]]
     costs = [float(c) for c in drug.costs[i0:]]
@@ -119,6 +156,7 @@ class Valuation:
 
 
 def loa(drug: Drug, p: tuple) -> float:
+    drug, p = resolve(drug, p)
     return float(np.prod(p[drug.phase_idx:]))
 
 

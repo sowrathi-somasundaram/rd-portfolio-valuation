@@ -7,7 +7,7 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from .model import PHASES, Drug, value, pv_components
+from .model import PHASES, Drug, pv_components, resolve, value
 
 # ---------------------------------------------------------------- scenarios
 
@@ -23,12 +23,14 @@ SCENARIOS = pd.DataFrame(
 
 
 def scale_p(p: tuple, mult: float, phases=None) -> tuple:
-    """Multiply success rates (optionally only some phases), capped at 99%."""
-    return tuple(min(0.99, x * mult) if phases is None or i in phases else x
+    """Multiply success rates (optionally only some phases), capped at 99% (or at the rate
+    itself if it is already higher, so an upside case never lowers it)."""
+    return tuple(min(max(0.99, x), x * mult) if phases is None or i in phases else x
                  for i, x in enumerate(p))
 
 
 def scenario_values(drug: Drug, p: tuple, rate: float, scenarios: pd.DataFrame = SCENARIOS) -> pd.DataFrame:
+    drug, p = resolve(drug, p)
     rows = []
     for name, s in scenarios.iterrows():
         d = drug.scaled(peak=s["Peak sales ×"], cost=s["R&D cost ×"])
@@ -41,6 +43,7 @@ def scenario_values(drug: Drug, p: tuple, rate: float, scenarios: pd.DataFrame =
 
 def tornado(drug: Drug, p: tuple, rate: float) -> tuple[float, pd.DataFrame]:
     """One-at-a-time sensitivity. Returns (base rNPV, table sorted by swing)."""
+    drug, p = resolve(drug, p)
     base = value(drug, p, rate).rnpv
     cases = [
         ("Peak sales", "−30%", "+30%",
@@ -104,7 +107,17 @@ def delay_probs(delay_prob: float) -> np.ndarray:
 
 def simulate_drug(drug: Drug, p: tuple, rate: float, n: int, rng: np.random.Generator) -> pd.DataFrame:
     """Simulate n development paths for one drug. Each path's NPV is a plain (unrisked)
-    NPV of what actually happened, so the mean across paths approximates rNPV."""
+    NPV of what actually happened, so the mean across paths approximates rNPV.
+
+    Every path is valued under two policies using the same random draws:
+
+    * ``npv``: committed. Once funded, the drug runs until it fails or is approved.
+    * ``npv_gated``: stage-gated. Before each later phase starts, the expected value of
+      continuing is re-checked and the programme is stopped if it is negative. The Phase II
+      readout is treated as proof of concept, so from the Phase III gate on the drug's true
+      commercial potential (its peak-sales draw) is known; earlier gates use the forecast.
+    """
+    drug, p = resolve(drug, p)
     probs = np.asarray(p[drug.phase_idx:])
     m = len(probs)
     failed = rng.random((n, m)) >= probs
@@ -123,14 +136,45 @@ def simulate_drug(drug: Drug, p: tuple, rate: float, n: int, rng: np.random.Gene
     unit = np.array([u for _, u in comps])
     cost = cum_cost[delay, np.minimum(stage, m - 1)]
     npv = -cost + approved * peak * unit[delay]
-    return pd.DataFrame({"npv": npv, "approved": approved, "stage": stage,
-                         "peak": np.where(approved, peak, np.nan), "delay": delay})
+
+    # Stage gates. Timing is unknown when deciding, so use costs and profits averaged over delays.
+    w = delay_probs(drug.delay_prob)
+    exp_cost = w @ np.array([c for c, _ in comps])
+    exp_unit = w @ unit
+    stop_at = np.full(n, m)                         # gate where the drug is stopped; m = never
+    for j in range(m - 1, 0, -1):                   # descending, so the earliest stop wins
+        reach = np.cumprod(np.r_[1.0, probs[j:-1]])     # P(reach phase k | at gate j), k = j..m-1
+        estimate = peak if drug.phase_idx + j >= PHASES.index("Phase III") else drug.peak_sales
+        cont = -(exp_cost[j:] @ reach) + probs[j:].prod() * estimate * exp_unit
+        stop_at = np.where((stage >= j) & (cont < 0), j, stop_at)
+    stopped = stop_at < m
+    npv_gated = np.where(stopped, -cum_cost[delay, np.maximum(stop_at - 1, 0)], npv)
+
+    return pd.DataFrame({"npv": npv, "npv_gated": npv_gated, "stopped": stopped, "approved": approved,
+                         "stage": stage, "peak": np.where(approved, peak, np.nan), "delay": delay})
 
 
-def simulate_portfolio(drugs: list[Drug], p: tuple, rate: float, n: int = 10_000, seed: int = 7) -> pd.DataFrame:
-    """NPV per path for every drug (columns = drug names). Drugs are independent."""
+def simulate_portfolio(drugs: list[Drug], p: tuple, rate: float, n: int = 10_000, seed: int = 7,
+                       gated: bool = False) -> pd.DataFrame:
+    """NPV per path for every drug (columns = drug names). Drugs are independent.
+    ``gated=True`` returns the stage-gated policy's values from the same draws."""
     rng = np.random.default_rng(seed)
-    return pd.DataFrame({d.name: simulate_drug(d, p, rate, n, rng)["npv"].to_numpy() for d in drugs})
+    col = "npv_gated" if gated else "npv"
+    return pd.DataFrame({d.name: simulate_drug(d, p, rate, n, rng)[col].to_numpy() for d in drugs})
+
+
+def stage_gate_table(drugs: list[Drug], p: tuple, rate: float, n: int = 10_000, seed: int = 7) -> pd.DataFrame:
+    """Expected value per drug when committing to a programme vs reviewing it at each gate."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for d in drugs:
+        s = simulate_drug(d, p, rate, n, rng)
+        rows.append({"Drug": d.name, "Phase": d.phase, "Committed": s["npv"].mean(),
+                     "Stage-gated": s["npv_gated"].mean(), "Stopped at a gate": s["stopped"].mean(),
+                     "P(loss) committed": (s["npv"] < 0).mean(), "P(loss) gated": (s["npv_gated"] < 0).mean()})
+    df = pd.DataFrame(rows)
+    df["Value added"] = df["Stage-gated"] - df["Committed"]
+    return df
 
 
 def summarize(values: np.ndarray) -> dict:
