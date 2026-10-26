@@ -1,5 +1,7 @@
 # R&D Portfolio Valuation
 
+**Live app:** https://rd-portfolio-valuation-wswk5umxshbbxrlunf94hi.streamlit.app/
+
 I built this to get hands-on with how pharma companies decide which drug programmes to fund. It takes
 five made-up drug candidates at different stages of development, values each one with risk-adjusted
 NPV (rNPV), and then works out which ones to fund with a fixed R&D budget.
