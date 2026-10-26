@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from rnpv.analysis import (compare_selections, optimal_selection, portfolio_table, portfolio_tornado,
@@ -122,3 +123,8 @@ def test_robustness_study():
     assert s["capture_rnpv_median"] >= s["capture_npv_median"]
     assert s["win"] > s["loss"]
     assert run_study(n_portfolios=20, seed=11).equals(run_study(n_portfolios=20, seed=11))
+
+
+def test_saved_robustness_results_match_a_fresh_run():
+    saved = pd.read_csv("data/robustness_study.csv")
+    pd.testing.assert_frame_equal(saved, run_study(), check_exact=False, rtol=1e-9)

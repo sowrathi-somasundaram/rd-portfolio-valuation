@@ -82,7 +82,7 @@ a useful way to catch mistakes in either one.
 - `app.py`: the Streamlit app
 - `rnpv/model.py`: cash flows, NPV and rNPV
 - `rnpv/analysis.py`: scenarios, tornado, Monte Carlo, stage-gating and portfolio selection
-- `rnpv/robustness.py`: the random-portfolio study
+- `rnpv/robustness.py`: the random-portfolio study (`data/robustness_study.csv` holds its saved results)
 - `rnpv/data.py`: the five example drugs
 - `tests/`: tests
 

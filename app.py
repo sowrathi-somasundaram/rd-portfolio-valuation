@@ -136,9 +136,17 @@ def run_gates(drugs: list[Drug], p: tuple, rate: float, n: int, seed: int) -> pd
     return stage_gate_table(drugs, p, rate, n, seed)
 
 
+STUDY_FILE = "data/robustness_study.csv"
+
+
 @st.cache_data(show_spinner="Testing 1,000 random portfolios…")
 def run_robustness() -> pd.DataFrame:
-    return run_study()
+    # The study is fixed by its seed, so the app ships its saved results (a test checks they
+    # still match a fresh run) and only recomputes if the file is missing.
+    try:
+        return pd.read_csv(STUDY_FILE)
+    except FileNotFoundError:
+        return run_study()
 
 
 gates = run_gates(drugs, p, rate, n_sims, seed)
