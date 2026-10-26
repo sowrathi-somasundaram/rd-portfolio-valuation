@@ -3,8 +3,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from rnpv.analysis import optimal_selection, portfolio_table, simulate_drug, tornado
-from rnpv.data import DEFAULT_DRUGS, DEFAULT_RATE
+from rnpv.analysis import (compare_selections, optimal_selection, portfolio_table, portfolio_tornado,
+                           simulate_drug, simulate_portfolio, tornado)
+from rnpv.data import DEFAULT_BUDGET, DEFAULT_DRUGS, DEFAULT_RATE
 from rnpv.model import BIO_SUCCESS, loa, value
 
 P, R = BIO_SUCCESS, DEFAULT_RATE
@@ -47,3 +48,35 @@ def test_optimal_selection_respects_budget():
     for budget in (0, 300, 600, 900, 5000):
         chosen = optimal_selection(table, budget)
         assert table.set_index("Drug").loc[chosen, "Expected R&D spend"].sum() <= budget
+
+
+def test_npv_ranking_vs_rnpv_ranking():
+    sims = simulate_portfolio(DEFAULT_DRUGS, P, R, 10_000, seed=7)
+    c = compare_selections(DEFAULT_DRUGS, P, R, DEFAULT_BUDGET, sims)
+    rnpv_pick, npv_pick = c.loc["Rank by rNPV per R&D $"], c.loc["Rank by plain NPV"]
+
+    # Both respect the same budget.
+    assert (c["Expected R&D spend"] <= DEFAULT_BUDGET).all()
+    # Ranking by risk-adjusted efficiency finds the true optimum here; ranking by NPV does not.
+    table = portfolio_table(DEFAULT_DRUGS, P, R)
+    assert set(rnpv_pick["Drugs funded"]) == set(optimal_selection(table, DEFAULT_BUDGET))
+    assert rnpv_pick["Total rNPV"] > npv_pick["Total rNPV"]
+    # NPV ranking looks better unrisked but is worse once risk is priced in.
+    assert npv_pick["Total NPV"] > rnpv_pick["Total NPV"]
+    assert npv_pick["P(loss)"] > rnpv_pick["P(loss)"]
+    # Plain NPV can't see that ONC-117 destroys value after risk adjustment.
+    assert "ONC-117" in npv_pick["Drugs funded"] and "ONC-117" not in rnpv_pick["Drugs funded"]
+
+
+def test_comparison_is_reproducible_with_fixed_seed():
+    a = compare_selections(DEFAULT_DRUGS, P, R, DEFAULT_BUDGET, simulate_portfolio(DEFAULT_DRUGS, P, R, 10_000, seed=7))
+    b = compare_selections(DEFAULT_DRUGS, P, R, DEFAULT_BUDGET, simulate_portfolio(DEFAULT_DRUGS, P, R, 10_000, seed=7))
+    assert a.drop(columns="Drugs funded").equals(b.drop(columns="Drugs funded"))
+
+
+def test_portfolio_tornado_is_sum_of_drug_tornados():
+    base, t = portfolio_tornado(DEFAULT_DRUGS, P, R)
+    assert base == pytest.approx(sum(value(d, P, R).rnpv for d in DEFAULT_DRUGS))
+    peak = t.set_index("Input").loc["Peak sales"]
+    expected = sum(tornado(d, P, R)[1].set_index("Input").loc["Peak sales", "Swing"] for d in DEFAULT_DRUGS)
+    assert peak["Swing"] == pytest.approx(expected)

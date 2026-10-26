@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from rnpv.analysis import (SCENARIOS, all_subsets, greedy_selection, optimal_selection,
+from rnpv.analysis import (SCENARIOS, all_subsets, compare_selections, greedy_selection, optimal_selection,
                            portfolio_table, scenario_values, simulate_portfolio, summarize, tornado)
 from rnpv.data import DEFAULT_BUDGET, DEFAULT_DRUGS, DEFAULT_RATE
 from rnpv.model import BIO_SUCCESS, PHASES, START_YEAR, Drug, cash_flows, value
@@ -257,6 +257,20 @@ with tabs[4]:
     if set(greedy) != set(optimal):
         msg += f" Funding in rank order alone would pick {', '.join(greedy)}, which is worse, so the budget is lumpy."
     st.info(msg)
+
+    st.subheader("What if we ranked by plain NPV?")
+    comp = compare_selections(drugs, p, rate, budget, sims)
+    a, b = comp["Total rNPV"]
+    show = comp.assign(**{"Drugs funded": comp["Drugs funded"].map(lambda x: ", ".join(x) or "none")})
+    st.dataframe(show[["Drugs funded", "Total NPV", "Total rNPV", "Expected R&D spend", "P(loss)", "P10", "P50", "P90"]]
+                 .style.format({"Total NPV": "{:,.0f}", "Total rNPV": "{:,.0f}", "Expected R&D spend": "{:,.0f}",
+                                "P(loss)": "{:.1%}", "P10": "{:,.0f}", "P50": "{:,.0f}", "P90": "{:,.0f}"}),
+                 use_container_width=True)
+    if a > 0 and a != b:
+        st.caption(f"Same budget, same funding rule, only the ranking changes. Ranking by plain NPV gives "
+                   f"**{(b - a) / a:+.1%}** risk-adjusted value versus ranking by rNPV per R&D dollar. "
+                   f"Plain NPV assumes every trial succeeds, so it favours big, early-stage bets. "
+                   f"P(loss) and P10/P50/P90 come from the Monte Carlo runs above ($M).")
 
     st.subheader("Choose what to fund")
     cols = st.columns(len(names))

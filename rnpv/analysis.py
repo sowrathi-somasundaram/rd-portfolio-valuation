@@ -74,6 +74,24 @@ def tornado(drug: Drug, p: tuple, rate: float) -> tuple[float, pd.DataFrame]:
     return base, pd.DataFrame(rows).sort_values("Swing", ascending=False, ignore_index=True)
 
 
+def portfolio_tornado(drugs: list[Drug], p: tuple, rate: float) -> tuple[float, pd.DataFrame]:
+    """Tornado on total portfolio rNPV: each input moves for every drug at once.
+
+    rNPV is additive across drugs, so the portfolio swing is the sum of each drug's change.
+    A phase success rate only affects drugs that still have that phase ahead of them.
+    """
+    base, deltas = 0.0, {}
+    for d in drugs:
+        b, t = tornado(d, p, rate)
+        base += b
+        for _, r in t.iterrows():
+            lo, hi = deltas.get(r["Input"], (0.0, 0.0))
+            deltas[r["Input"]] = (lo + r["rNPV downside"] - b, hi + r["rNPV upside"] - b)
+    rows = [{"Input": k, "rNPV downside": base + lo, "rNPV upside": base + hi, "Swing": abs(hi - lo)}
+            for k, (lo, hi) in deltas.items()]
+    return base, pd.DataFrame(rows).sort_values("Swing", ascending=False, ignore_index=True)
+
+
 # ---------------------------------------------------------------- Monte Carlo
 
 DELAYS = np.array([0, 1, 2])
@@ -135,14 +153,41 @@ def portfolio_table(drugs: list[Drug], p: tuple, rate: float) -> pd.DataFrame:
     return df
 
 
-def greedy_selection(table: pd.DataFrame, budget: float) -> list[str]:
-    """Fund in order of rNPV per R&D dollar, skipping anything that would break the budget."""
+def greedy_selection(table: pd.DataFrame, budget: float, rank_by: str = "rNPV per R&D $") -> list[str]:
+    """Fund in order of ``rank_by`` (highest first), skipping anything that would break the
+    budget or that the ranking metric itself says destroys value."""
     chosen, spent = [], 0.0
-    for _, r in table.sort_values("rNPV per R&D $", ascending=False).iterrows():
-        if r["rNPV"] > 0 and spent + r["Expected R&D spend"] <= budget:
+    for _, r in table.sort_values(rank_by, ascending=False).iterrows():
+        if r[rank_by] > 0 and spent + r["Expected R&D spend"] <= budget:
             chosen.append(r["Drug"])
             spent += r["Expected R&D spend"]
     return chosen
+
+
+# How each selection approach ranks candidates before funding them within the budget.
+SELECTION_METHODS = {"Rank by rNPV per R&D $": "rNPV per R&D $", "Rank by plain NPV": "NPV"}
+
+
+def compare_selections(drugs: list[Drug], p: tuple, rate: float, budget: float,
+                       sims: pd.DataFrame) -> pd.DataFrame:
+    """Run the same budget-constrained selection under each ranking in SELECTION_METHODS and
+    score every resulting portfolio on risk-adjusted value and simulated outcomes.
+
+    ``sims`` is the output of ``simulate_portfolio``; reusing one set of simulated paths keeps
+    the comparison free of sampling noise between methods.
+    """
+    table = portfolio_table(drugs, p, rate).set_index("Drug")
+    rows = []
+    for method, col in SELECTION_METHODS.items():
+        chosen = greedy_selection(table.reset_index(), budget, rank_by=col)
+        s = summarize(sims[chosen].sum(axis=1).to_numpy() if chosen else np.zeros(len(sims)))
+        rows.append({"Method": method, "Drugs funded": chosen,
+                     "Total NPV": table.loc[chosen, "NPV"].sum(),
+                     "Total rNPV": table.loc[chosen, "rNPV"].sum(),
+                     "Expected R&D spend": table.loc[chosen, "Expected R&D spend"].sum(),
+                     "MC mean": s["mean"], "P(loss)": s["p_loss"],
+                     "P10": s["p10"], "P50": s["p50"], "P90": s["p90"]})
+    return pd.DataFrame(rows).set_index("Method")
 
 
 @dataclass
